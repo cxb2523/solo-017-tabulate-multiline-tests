@@ -4,7 +4,20 @@ from decimal import Decimal
 
 from pytest import mark
 
-from tabulate import SEPARATING_LINE, simple_separated_format, tabulate
+from tabulate import (
+    SEPARATING_LINE,
+    _strip_ansi,
+    _visible_width,
+    simple_separated_format,
+    tabulate,
+)
+
+try:
+    import wcwidth
+except ImportError:
+    wcwidth = None
+
+requires_wcwidth = mark.skipif(wcwidth is None, reason="requires wcwidth")
 
 from common import assert_equal, check_warnings, raises, skip
 
@@ -71,6 +84,92 @@ def test_plain_multiline_with_links():
     )
     result = tabulate(table, headers, tablefmt="plain")
     assert_equal(expected, result)
+
+
+def test_crlf_multiline_header_and_data_produce_no_blank_grid_rows(monkeypatch):
+    "Output: CRLF multiline cells use one physical row per text line"
+    monkeypatch.setattr("tabulate.wcwidth", None)
+    result = tabulate([["one\r\ntwo"]], ["alpha\r\nbeta"], tablefmt="grid")
+    lines = result.splitlines()
+
+    assert len(lines) == 7
+    assert lines == [
+        "+---------+",
+        "| alpha   |",
+        "| beta    |",
+        "+=========+",
+        "| one     |",
+        "| two     |",
+        "+---------+",
+    ]
+    assert [_visible_width(line) for line in lines] == [11] * 7
+
+
+def test_ansi_multiline_lines_have_equal_grid_widths():
+    "Output: independently colored lines in a multiline cell align both borders"
+    colored_lines = "\x1b[31mred\x1b[0m\n\x1b[32mred\x1b[0m"
+    result = tabulate([[colored_lines, "x\nx"]], ["name", "tag"], tablefmt="grid")
+    lines = result.splitlines()
+    expected_border = "+--------+-------+"
+
+    assert len(lines) == 6
+    assert lines[0] == expected_border
+    assert lines[1] == "| name   | tag   |"
+    assert lines[2] == "+========+=======+"
+    assert [_strip_ansi(line) for line in lines[3:5]] == [
+        "| red    | x     |",
+        "| red    | x     |",
+    ]
+    assert lines[5] == expected_border
+    assert [_visible_width(line) for line in lines] == [18] * 6
+
+
+@requires_wcwidth
+def test_wide_and_ascii_multiline_rows_share_grid_column_width():
+    "Output: wide CJK lines and an ASCII row use the same visible column width"
+    table = [
+        ["甲乙\n丙丁", "abc\ndef"],
+        ["de", "xy"],
+    ]
+    result = tabulate(table, ["name", "note"], tablefmt="grid")
+    lines = result.splitlines()
+    expected_border = "+--------+--------+"
+
+    assert len(lines) == 8
+    assert lines == [
+        expected_border,
+        "| name   | note   |",
+        "+========+========+",
+        "| 甲乙   | abc    |",
+        "| 丙丁   | def    |",
+        expected_border,
+        "| de     | xy     |",
+        expected_border,
+    ]
+    assert [_visible_width(line) for line in lines] == [19] * 8
+
+
+@requires_wcwidth
+def test_ansi_wrapped_wide_multiline_text_does_not_shift_grid_borders():
+    "Output: ANSI wrapping a wide character does not move later grid borders"
+    table = [
+        ["\x1b[31m甲乙\x1b[0m\n丙", "abc\ndef"],
+        ["de", "xy"],
+    ]
+    result = tabulate(table, ["name", "note"], tablefmt="grid")
+    lines = result.splitlines()
+    expected_border = "+--------+--------+"
+
+    assert len(lines) == 8
+    assert lines[0] == expected_border
+    assert lines[1] == "| name   | note   |"
+    assert lines[2] == "+========+========+"
+    assert _strip_ansi(lines[3]) == "| 甲乙   | abc    |"
+    assert _strip_ansi(lines[4]) == "| 丙     | def    |"
+    assert lines[5] == expected_border
+    assert _strip_ansi(lines[6]) == "| de     | xy     |"
+    assert lines[7] == expected_border
+    assert [_visible_width(line) for line in lines] == [19] * 8
 
 
 def test_plain_multiline_with_empty_cells():
