@@ -1,5 +1,6 @@
 """Test output of the various forms of tabular data."""
 
+import re
 from decimal import Decimal
 
 from pytest import mark
@@ -7,6 +8,30 @@ from pytest import mark
 from tabulate import SEPARATING_LINE, simple_separated_format, tabulate
 
 from common import assert_equal, check_warnings, raises, skip
+
+try:
+    import wcwidth
+except ImportError:
+    wcwidth = None
+
+_ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_line_width(line):
+    "Visible width of one output line, ignoring ANSI color codes."
+    stripped = _ansi_escape.sub("", line)
+    if wcwidth is not None:
+        return wcwidth.wcswidth(stripped)
+    return len(stripped)
+
+
+def _assert_block_aligned(result, expected_nlines):
+    "Every printed line of a table must share the same visible width."
+    lines = result.split("\n")
+    assert_equal(expected_nlines, len(lines))
+    widths = [_visible_line_width(line) for line in lines]
+    assert widths == [widths[0]] * len(widths), f"ragged lines: {widths}"
+    return lines
 
 # _test_table shows
 #  - coercion of a string to a number,
@@ -3349,3 +3374,70 @@ def test_break_on_hyphens():
     expected = "h1    h2    h3\n----  ----  ----\nfoo-  bar-  foo-\nbar   bar   foo"
     result = tabulate(test_table, table_headers, maxcolwidths=5, break_on_hyphens=True)
     assert_equal(expected, result)
+
+
+def test_grid_multiline_crlf_no_extra_blank_lines():
+    "Output: CRLF line endings in headers and cells produce no extra blank lines"
+    table = [["a\r\nbb", "x"], ["ccc", "y"]]
+    headers = ["h1\r\nh1b", "h2"]
+    expected = "\n".join(
+        [
+            "+-------+------+",
+            "| h1    | h2   |",
+            "| h1b   |      |",
+            "+=======+======+",
+            "| a     | x    |",
+            "| bb    |      |",
+            "+-------+------+",
+            "| ccc   | y    |",
+            "+-------+------+",
+        ]
+    )
+    result = tabulate(table, headers=headers, tablefmt="grid")
+    assert_equal(expected, result)
+    lines = _assert_block_aligned(result, 9)
+    # no spurious empty row between the CRLF-split header lines
+    assert not any(set(line) <= set("|+ ") for line in lines[1:3])
+
+
+def test_grid_multiline_ansi_equal_visible_width_per_line():
+    "Output: ANSI-colored multiline cells keep every line of a row equally wide"
+    table = [["\x1b[31mfoo\x1b[0m\nbar", "x"], ["baz", "y"]]
+    result = tabulate(table, headers=["h1", "h2"], tablefmt="grid")
+    lines = _assert_block_aligned(result, 8)
+    # both physical lines of the multiline row share the same visible width
+    row_lines = [line for line in lines if "foo" in line or "bar" in line]
+    assert_equal(2, len(row_lines))
+    assert_equal(_visible_line_width(row_lines[0]), _visible_line_width(row_lines[1]))
+
+
+def test_grid_multiline_wide_chars_mixed_ascii_consistent_width():
+    "Output: wide CJK chars mixed with ASCII align to the same column width"
+    if wcwidth is None:
+        skip("test_grid_multiline_wide_chars_mixed_ascii_consistent_width requires wcwidth")
+    table = [["中文ab\nxy", "v"], ["wxyz", "w"]]
+    result = tabulate(table, headers=["h1", "h2"], tablefmt="grid")
+    lines = _assert_block_aligned(result, 8)
+    # the wide-char line and the ASCII line of the row end at the same border
+    assert "中文ab" in lines[3] and "xy" in lines[4]
+    assert_equal(_visible_line_width(lines[3]), _visible_line_width(lines[4]))
+
+
+def test_grid_multiline_ansi_wrapping_wide_chars_border_not_shifting():
+    "Output: ANSI codes around wide chars do not shift the right table border"
+    if wcwidth is None:
+        skip("test_grid_multiline_ansi_wrapping_wide_chars_border_not_shifting requires wcwidth")
+    table = [["\x1b[31m中文\x1b[0m\nab", "v"], ["cd", "w"]]
+    result = tabulate(table, headers=["h1", "h2"], tablefmt="grid")
+    lines = _assert_block_aligned(result, 8)
+    # the right border column must not drift between lines; wide chars occupy
+    # two display columns but one string index, so measure the display column
+    border_positions = []
+    for line in lines:
+        stripped = _ansi_escape.sub("", line)
+        if "|" in stripped:
+            prefix = stripped[: stripped.rfind("|")]
+            border_positions.append(_visible_line_width(prefix))
+    assert border_positions == [border_positions[0]] * len(border_positions), (
+        f"right border drifts: {border_positions}"
+    )
